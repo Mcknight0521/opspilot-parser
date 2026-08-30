@@ -2,7 +2,10 @@ import csv
 import io
 import os
 import re
-from datetime import datetime
+import urllib.request
+import urllib.parse
+import html as html_lib
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +22,7 @@ from odf.table import Table, TableRow, TableCell, CoveredTableCell
 from odf import teletype
 from odf.namespaces import TABLENS
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "4.0.0"
 MAX_BYTES = 30 * 1024 * 1024
 SUPPORTED = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "txt"]
 
@@ -49,17 +52,23 @@ NUM_RE = re.compile(r"^-?[\d,]+(?:\.\d+)?$")
 TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 
 ALIASES = {
-    "date": ["日期", "交易日期", "銷售日期", "調整日", "date", "sales date"],
-    "sku": ["單品編號", "商品編號", "品號", "料號", "sku", "item code", "product code"],
-    "item": ["單品名稱", "商品名稱", "品名", "名稱", "item name", "product name"],
-    "qty": ["銷售量", "數量", "銷量", "qty", "quantity", "sales qty"],
-    "sales": ["銷售額(含稅)", "含稅營業額", "營業額", "銷售額", "sales", "revenue", "amount"],
+    "date": ["日期", "營運日期", "交易日期", "銷售日期", "調整日", "date", "sales date", "business date"],
+    "sku": ["單品編號", "商品編號", "商品代碼", "品號", "料號", "sku", "item code", "product code"],
+    "item": ["單品名稱", "商品名稱", "品名", "品項", "名稱", "item name", "product name"],
+    "qty": ["銷售量", "銷售件數", "數量", "銷量", "qty", "quantity", "sales qty"],
+    "sales": ["銷售額(含稅)", "含稅營業額", "營業額", "銷售額", "銷售淨額", "sales", "revenue", "amount", "net revenue"],
     "salesExTax": ["銷售額(未稅)", "未稅營業額", "未稅銷售額", "sales ex tax", "net sales"],
     "tax": ["稅額", "tax", "vat"],
-    "waste": ["報廢", "報廢金額", "損耗", "損耗金額", "waste", "scrap"],
-    "clearance": ["降價出清金額", "出清金額", "出清", "clearance", "markdown amount"],
+    "waste": ["報廢", "報廢金額", "報廢損失", "損耗", "損耗金額", "waste", "scrap"],
+    "clearance": ["降價出清金額", "出清金額", "折價出清", "出清", "clearance", "markdown amount"],
     "clearanceQty": ["降價出清數量", "出清數量", "clearance qty", "markdown qty"],
+    "traffic": ["來客數", "入店人數", "客數", "traffic", "visitors", "customers"],
+    "laborHours": ["工時", "人員工時", "總工時", "labor hours", "work hours"],
+    "department": ["部門", "部門名稱", "課別", "department"],
+    "category": ["分類", "分類別", "商品分類", "category"],
+    "store": ["門市", "店別", "店名", "store"],
 }
+
 
 
 def clean(v: Any) -> str:
@@ -395,6 +404,7 @@ def finalize_daily_sales(detail, name, source_type, sheet, source_totals=None, e
         mergedSkuRows=len(rows),
         duplicateNpRowsMerged=dup_removed,
     )
+    validation["dataCompleteness"] = _completeness(rows, rows[0].get("periodStart") if rows else None, rows[0].get("periodEnd") if rows else None, "report_header")
     if validation["status"] == "failed":
         raise HTTPException(status_code=422, detail={"message": "報表驗算失敗，為避免錯誤數字，本次不匯入。", "validation": validation})
     return {
@@ -405,7 +415,7 @@ def finalize_daily_sales(detail, name, source_type, sheet, source_totals=None, e
         "totals": {k: round(v, 2) for k, v in calc.items()},
         "rows": rows,
         "meta": {
-            "parser": "backend-daily-sales-v3", "reportType": "每日銷售報表 - 依單品", "sourceType": source_type,
+            "parser": "backend-daily-sales-v4", "reportType": "每日銷售報表 - 依單品", "sourceType": source_type,
             "sourceFile": name, "sheet": sheet, "periodStart": rows[0].get("periodStart") if rows else None,
             "periodEnd": rows[0].get("periodEnd") if rows else None, "rawDetailRows": len(detail), "parsedProducts": len(rows),
             "excludedSummaryRows": excluded_summary_rows,
@@ -628,65 +638,140 @@ def find_generic_header(table):
     return best
 
 
-def parse_generic_table(table, name, source_type, sheet=None):
+def _date_range(start, end):
+    if not start or not end:
+        return []
+    try:
+        a = datetime.fromisoformat(start).date(); b = datetime.fromisoformat(end).date()
+    except Exception:
+        return []
+    if b < a or (b-a).days > 3660:
+        return []
+    return [(a + timedelta(days=i)).isoformat() for i in range((b-a).days+1)]
+
+
+def _extract_period_from_tables(tables, filename=""):
+    dates=[]
+    text=[]
+    for sheet, table in tables:
+        for row in table[:80]:
+            for v in row:
+                if v is None: continue
+                text.append(clean(v))
+                iso=to_iso(v)
+                if iso: dates.append(iso)
+    joined=" ".join(text)
+    # Explicit ranges like 2026/09/01～2026/09/30 or 01/08/2026 ... 30/08/2026
+    for pat in [r'(20\d{2})[/-](\d{1,2})[/-](\d{1,2})\s*[～~至-]\s*(20\d{2})[/-](\d{1,2})[/-](\d{1,2})',
+                r'(\d{1,2})/(\d{1,2})/(20\d{2}).{0,30}?(\d{1,2})/(\d{1,2})/(20\d{2})']:
+        m=re.search(pat, joined)
+        if m:
+            g=list(map(int,m.groups()))
+            try:
+                if len(g)==6 and g[0]>=2000: return date(g[0],g[1],g[2]).isoformat(), date(g[3],g[4],g[5]).isoformat(), 'report_header'
+                return date(g[2],g[1],g[0]).isoformat(), date(g[5],g[4],g[3]).isoformat(), 'report_header'
+            except Exception: pass
+    # Filename range, useful for exports that omit period metadata.
+    m=re.search(r'(20\d{2})(\d{2})(\d{2})[-_~至]+(20\d{2})(\d{2})(\d{2})', filename)
+    if m:
+        g=list(map(int,m.groups()))
+        try: return date(g[0],g[1],g[2]).isoformat(), date(g[3],g[4],g[5]).isoformat(), 'filename'
+        except Exception: pass
+    return (min(dates), max(dates), 'observed_dates') if dates else (None,None,None)
+
+
+def _completeness(rows, period_start=None, period_end=None, period_source=None):
+    actual=sorted({r.get('date') for r in rows if r.get('date')})
+    if not actual:
+        return {"status":"not_applicable","reason":"此報表沒有可安全辨識的逐日日期。"}
+    start=period_start or actual[0]; end=period_end or actual[-1]
+    expected=_date_range(start,end)
+    missing=[d for d in expected if d not in set(actual)]
+    extra=[d for d in actual if expected and d not in set(expected)]
+    return {
+        "status":"complete" if not missing and not extra else "incomplete",
+        "periodStart":start,"periodEnd":end,"periodSource":period_source or "observed_dates",
+        "expectedDays":len(expected),"actualDays":len(actual),"missingDays":missing,"extraDays":extra,
+        "missingCount":len(missing),"note":"缺少日期不會自動視為 0 元，也不會自行推定停業原因。" if missing else None,
+    }
+
+
+def _daily_dimension_summary(rows, field):
+    by={}
+    for r in rows:
+        d=r.get('date'); v=r.get(field)
+        if not d or v is None: continue
+        by.setdefault(d,[]).append(v)
+    if not by: return None
+    daily={}; ambiguous=[]; strategy={}
+    for d, vals in by.items():
+        uniq=[]
+        for v in vals:
+            if v not in uniq: uniq.append(v)
+        if len(uniq)==1:
+            daily[d]=uniq[0]; strategy[d]='deduplicated_daily_value'
+        else:
+            # Multiple different values at item grain cannot safely be called store-day traffic/labor.
+            daily[d]=None; ambiguous.append(d); strategy[d]='ambiguous_item_level_values'
+    return {"dailyValues":daily,"ambiguousDates":ambiguous,"safeDays":sum(v is not None for v in daily.values()),
+            "status":"verified" if not ambiguous else "partial",
+            "rule":"同日期各商品值完全相同時只計一次；不同時不擅自加總。"}
+
+def parse_generic_table(table, name, source_type, sheet=None, global_period=None):
     found = find_generic_header(table)
     if not found:
         raise ValueError("unsupported")
     score, hi, mapping = found
     if "sku" not in mapping and "item" not in mapping:
         raise ValueError("unsupported")
-    rows = []
-    excluded = 0
-    for row in table[hi + 1:]:
-        vals = [clean(x) for x in row]
-        if any(re.search(r"(^|\s)(小計|總計|subtotal|grand total)(\s|$)", x, re.I) for x in vals if x):
-            excluded += 1
-            continue
-        sku = clean(row[mapping["sku"]]) if "sku" in mapping and mapping["sku"] < len(row) else ""
-        item = clean(row[mapping["item"]]) if "item" in mapping and mapping["item"] < len(row) else ""
-        if not sku and not item:
-            continue
-        sales = num(row[mapping["sales"]]) if "sales" in mapping else None
-        qty = num(row[mapping["qty"]]) if "qty" in mapping else None
-        waste = num(row[mapping["waste"]]) if "waste" in mapping else None
-        clearance = num(row[mapping["clearance"]]) if "clearance" in mapping else None
-        date = to_iso(row[mapping["date"]]) if "date" in mapping else None
+    rows=[]; excluded=0
+    for row in table[hi+1:]:
+        vals=[clean(x) for x in row]
+        if any(re.search(r"(^|\s)(小計|總計|subtotal|grand total)(\s|$)",x,re.I) for x in vals if x):
+            excluded+=1; continue
+        sku=clean(row[mapping["sku"]]) if "sku" in mapping and mapping["sku"]<len(row) else ""
+        item=clean(row[mapping["item"]]) if "item" in mapping and mapping["item"]<len(row) else ""
+        d=to_iso(row[mapping["date"]]) if "date" in mapping and mapping["date"]<len(row) else None
+        # Require a real data identity; footer/note rows are ignored.
+        if not sku and not item: continue
+        if "date" in mapping and not d: continue
+        def val(f): return num(row[mapping[f]]) if f in mapping and mapping[f] < len(row) else None
         rows.append({
-            "date": date, "sku": sku or item, "item": item or sku, "englishName": None,
-            "qty": qty, "sales": sales, "salesExTax": num(row[mapping["salesExTax"]]) if "salesExTax" in mapping else None,
-            "tax": num(row[mapping["tax"]]) if "tax" in mapping else None,
-            "waste": waste, "clearance": clearance,
-            "clearanceQty": num(row[mapping["clearanceQty"]]) if "clearanceQty" in mapping else None,
-            "sourceType": source_type, "sourceFile": name,
+            "date":d,"sku":sku or item,"item":item or sku,"englishName":None,
+            "qty":val("qty"),"sales":val("sales"),"salesExTax":val("salesExTax"),"tax":val("tax"),
+            "waste":val("waste"),"clearance":val("clearance"),"clearanceQty":val("clearanceQty"),
+            "traffic":val("traffic"),"laborHours":val("laborHours"),
+            "department":clean(row[mapping["department"]]) if "department" in mapping else None,
+            "category":clean(row[mapping["category"]]) if "category" in mapping else None,
+            "store":clean(row[mapping["store"]]) if "store" in mapping else None,
+            "sourceType":source_type,"sourceFile":name,
         })
-    if not rows:
-        raise ValueError("unparsed")
-    dates = sorted({r["date"] for r in rows if r.get("date")})
-    for r in rows:
-        r["periodStart"] = dates[0] if dates else None
-        r["periodEnd"] = dates[-1] if dates else None
-    checks = []
+    if not rows: raise ValueError("unparsed")
+    gp=global_period or (None,None,None); ps,pe,psrc=gp
+    dates=sorted({r["date"] for r in rows if r.get("date")})
+    ps=ps or (dates[0] if dates else None); pe=pe or (dates[-1] if dates else None)
+    for r in rows: r["periodStart"]=ps; r["periodEnd"]=pe
+    checks=[]
     if "salesExTax" in mapping and "tax" in mapping and "sales" in mapping:
-        checked = [r for r in rows if r.get("sales") is not None]
-        bad = sum(1 for r in checked if not close((r.get("salesExTax") or 0) + (r.get("tax") or 0), r.get("sales") or 0, 1.05))
-        checks.append({"metric": "row_tax_math", "status": "passed" if bad == 0 else "partial", "matchedRows": len(checked)-bad, "totalRows": len(checked)})
-    checks.append({"metric": "source_grand_total", "status": "unverified", "reason": "通用格式未找到可安全辨識的原始總計；已保留為部分驗證。"})
-    confidence = min(.88, .50 + score * .06)
-    validation = summarize_checks(checks, mappedFields=sorted(mapping.keys()), excludedSummaryRows=excluded, parsedRows=len(rows))
-    totals = {
-        "sales": round(sum(r.get("sales") or 0 for r in rows), 2) if "sales" in mapping else None,
-        "qty": round(sum(r.get("qty") or 0 for r in rows), 2) if "qty" in mapping else None,
-        "waste": round(sum(r.get("waste") or 0 for r in rows), 2) if "waste" in mapping else None,
-        "clearance": round(sum(r.get("clearance") or 0 for r in rows), 2) if "clearance" in mapping else None,
-    }
-    return {
-        "ok": True, "documentType": "generic_operational_table", "confidence": confidence,
-        "validation": validation, "totals": totals, "rows": rows,
-        "meta": {"parser": "backend-generic-table-v3", "reportType": "通用營運表格", "sourceType": source_type,
-                 "sourceFile": name, "sheet": sheet, "periodStart": dates[0] if dates else None, "periodEnd": dates[-1] if dates else None,
-                 "mappedFields": sorted(mapping.keys()), "requiresReview": True},
-    }
-
+        checked=[r for r in rows if r.get("sales") is not None]
+        bad=sum(1 for r in checked if not close((r.get("salesExTax") or 0)+(r.get("tax") or 0),r.get("sales") or 0,1.05))
+        checks.append({"metric":"row_tax_math","status":"passed" if bad==0 else "partial","matchedRows":len(checked)-bad,"totalRows":len(checked)})
+    checks.append({"metric":"source_grand_total","status":"unverified","reason":"通用格式未找到可安全辨識的原始總計；核心欄位採重算並標示部分驗證。"})
+    completeness=_completeness(rows,ps,pe,psrc)
+    traffic=_daily_dimension_summary(rows,"traffic") if "traffic" in mapping else None
+    labor=_daily_dimension_summary(rows,"laborHours") if "laborHours" in mapping else None
+    confidence=min(.96,.52+score*.055)
+    validation=summarize_checks(checks,mappedFields=sorted(mapping.keys()),excludedSummaryRows=excluded,parsedRows=len(rows))
+    validation["dataCompleteness"]=completeness
+    validation["dailyDimensions"]={"traffic":traffic,"laborHours":labor}
+    totals={f:(round(sum(r.get(f) or 0 for r in rows),2) if f in mapping else None) for f in ("sales","qty","waste","clearance")}
+    # Only expose traffic/labor total when daily values are unambiguous.
+    for f,obj in (("traffic",traffic),("laborHours",labor)):
+        totals[f]=round(sum(v for v in (obj or {}).get("dailyValues",{}).values() if v is not None),2) if obj and not obj.get("ambiguousDates") else None
+    return {"ok":True,"documentType":"generic_operational_table","confidence":confidence,"validation":validation,"totals":totals,"rows":rows,
+            "meta":{"parser":"backend-trust-engine-v4","reportType":"通用營運表格","sourceType":source_type,"sourceFile":name,"sheet":sheet,
+                    "periodStart":ps,"periodEnd":pe,"periodSource":psrc,"mappedFields":sorted(mapping.keys()),"requiresReview":validation["status"]!="passed",
+                    "trustEngine":"v4"}}
 
 def parse_tabular(data: bytes, name: str, ext: str):
     if ext in (".xlsx", ".xlsm", ".xls", ".ods"):
@@ -696,6 +781,7 @@ def parse_tabular(data: bytes, name: str, ext: str):
         table, enc, delim = text_to_table(data, ext)
         tables = [(None, table)]
         source_type = f"api-{ext[1:] or 'txt'}"
+    global_period = _extract_period_from_tables(tables, name)
     # First pass: known report fingerprints. Second pass: generic mapping.
     errors = []
     for sheet, table in tables:
@@ -708,7 +794,7 @@ def parse_tabular(data: bytes, name: str, ext: str):
     candidates = []
     for sheet, table in tables:
         try:
-            candidates.append(parse_generic_table(table, name, source_type, sheet))
+            candidates.append(parse_generic_table(table, name, source_type, sheet, global_period))
         except Exception as e:
             errors.append(f"{sheet or 'text'}:generic:{e}")
     if candidates:
@@ -739,10 +825,165 @@ def root():
     return {"ok": True, "service": "OpsPilot Universal Parser", "version": APP_VERSION, "docs": "/docs", "health": "/health"}
 
 
+
+
+COUNTY_NAMES = [
+    "基隆市","臺北市","新北市","桃園市","新竹市","新竹縣","苗栗縣","臺中市","彰化縣","南投縣",
+    "雲林縣","嘉義市","嘉義縣","臺南市","高雄市","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"
+]
+
+def _http_text(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 OpsPilot/3.2"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        enc = r.headers.get_content_charset() or "utf-8"
+        try:
+            return raw.decode(enc, errors="replace")
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+
+def _strip_html(v: str) -> str:
+    v = re.sub(r"<script[\s\S]*?</script>", " ", v or "", flags=re.I)
+    v = re.sub(r"<style[\s\S]*?</style>", " ", v, flags=re.I)
+    v = re.sub(r"<[^>]+>", " ", v)
+    return re.sub(r"\s+", " ", html_lib.unescape(v)).strip()
+
+def _roc_to_iso(y: str, m: str, d: str) -> str:
+    return f"{int(y)+1911:04d}-{int(m):02d}-{int(d):02d}"
+
+def _extract_history_links(page_html: str, base: str) -> list[dict]:
+    out, seen = [], set()
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']*information\?[^"\']*pid=\d+[^"\']*)["\'][^>]*>([\s\S]*?)</a>', page_html or '', re.I):
+        href, label = m.group(1), _strip_html(m.group(2))
+        around = _strip_html((page_html or '')[max(0,m.start()-260):m.end()+260])
+        dm = re.search(r'(\d{2,3})年\s*(\d{1,2})月\s*(\d{1,2})日', label + ' ' + around)
+        if not dm:
+            continue
+        url = urllib.parse.urljoin(base, html_lib.unescape(href))
+        key = (url, dm.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"date": _roc_to_iso(*dm.groups()), "url": url, "title": label or around[:120]})
+    return out
+
+def _extract_nds_links(detail_html: str, base: str) -> list[str]:
+    out=[]
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>', detail_html or '', re.I):
+        href, label = html_lib.unescape(m.group(1)), _strip_html(m.group(2))
+        if re.search(r'nds(?:E)?\.html|停止上班|停止辦公|停止上課', href+' '+label, re.I) and not re.search(r'ndsE\.html', href, re.I):
+            u=urllib.parse.urljoin(base, href)
+            if u not in out: out.append(u)
+    return out
+
+def _parse_region_closure(nds_html: str, region: str) -> dict:
+    plain = _strip_html(nds_html)
+    idx = plain.find(region)
+    if idx < 0:
+        return {"found": False, "closure": False, "detail": ""}
+    tail = plain[idx+len(region):]
+    stops=[]
+    for county in COUNTY_NAMES:
+        j=tail.find(county)
+        if j>=0: stops.append(j)
+    chunk = tail[:min(stops) if stops else 700].strip()
+    closure = bool(re.search(r'停止上班|停止上課|停止辦公|停班|停課', chunk)) and not bool(re.search(r'照常上班.{0,40}照常上課|正常上班.{0,40}正常上課', chunk))
+    scope = "partial"
+    if closure and re.match(r'^[：: ]*(?:今天|明天)?停止上班[、,， ]*(?:今天|明天)?停止上課', chunk):
+        scope = "countywide"
+    return {"found": True, "closure": closure, "detail": chunk[:500], "scope": scope}
+
+def _dgpa_closures(start: str, end: str, region: str) -> list[dict]:
+    base='https://www.dgpa.gov.tw'
+    targets=[]
+    start_dt=datetime.strptime(start,'%Y-%m-%d').date()
+    end_dt=datetime.strptime(end,'%Y-%m-%d').date()
+    for page in range(1,51):
+        url=f'{base}/informationlist?page={page}&uid=374'
+        try:
+            text=_http_text(url)
+        except Exception:
+            if page>3: break
+            continue
+        items=_extract_history_links(text,url)
+        if not items:
+            if page>3: break
+            continue
+        page_dates=[]
+        for it in items:
+            try: d=datetime.strptime(it['date'],'%Y-%m-%d').date()
+            except Exception: continue
+            page_dates.append(d)
+            if start_dt <= d <= end_dt:
+                targets.append(it)
+        if page_dates and min(page_dates) < start_dt:
+            break
+    uniq={x['url']:x for x in targets}.values()
+    out=[]
+    for it in uniq:
+        try:
+            detail=_http_text(it['url'])
+        except Exception:
+            continue
+        nds_links=_extract_nds_links(detail,it['url'])
+        parsed=None
+        for u in nds_links:
+            try:
+                parsed=_parse_region_closure(_http_text(u),region)
+            except Exception:
+                continue
+            if parsed.get('found'): break
+        if parsed and parsed.get('closure'):
+            out.append({
+                "type":"closure", "date":it['date'],
+                "name":"全縣停班停課" if parsed.get('scope')=='countywide' else "部分地區停班停課",
+                "detail":parsed.get('detail',''), "scope":parsed.get('scope','partial'),
+                "source":"行政院人事行政總處"
+            })
+    return sorted(out,key=lambda x:x['date'])
+
+@app.get("/history-events")
+def history_events(start: str, end: str, region: str = "屏東縣"):
+    try:
+        datetime.strptime(start, "%Y-%m-%d")
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="start/end must be YYYY-MM-DD")
+    if region not in COUNTY_NAMES:
+        raise HTTPException(status_code=422, detail="unsupported region")
+    try:
+        closures=_dgpa_closures(start,end,region)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"DGPA history lookup failed: {e}")
+    return {"ok":True,"region":region,"start":start,"end":end,"events":closures,"sources":["行政院人事行政總處"]}
+
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "opspilot-parser", "version": APP_VERSION, "formats": SUPPORTED, "endpoint": "/parse-file"}
+    return {"ok": True, "service": "opspilot-parser", "version": APP_VERSION, "engine": "Trust Engine v4", "formats": SUPPORTED, "endpoint": "/parse-file", "multiFileEndpoint": "/verify-files", "historyEndpoint": "/history-events"}
 
+
+@app.post("/verify-files")
+async def verify_files(files: list[UploadFile] = File(...)):
+    if not files or len(files) > 8:
+        raise HTTPException(status_code=400, detail="請上傳 1～8 個檔案。")
+    results=[]
+    for f in files:
+        data=await f.read()
+        if len(data)>MAX_BYTES:
+            results.append({"file":f.filename,"ok":False,"error":"file_too_large"}); continue
+        try: results.append({"file":f.filename,**parse_any(data,f.filename or "upload")})
+        except Exception as e: results.append({"file":f.filename,"ok":False,"error":str(e)})
+    comparable=[x for x in results if x.get("ok") and x.get("totals")]
+    pairs=[]
+    for i in range(len(comparable)):
+        for j in range(i+1,len(comparable)):
+            a,b=comparable[i],comparable[j]; metrics={}
+            for m in ("sales","qty","waste","clearance"):
+                av=a.get("totals",{}).get(m); bv=b.get("totals",{}).get(m)
+                if av is not None and bv is not None:
+                    metrics[m]={"a":av,"b":bv,"difference":round(av-bv,2),"matched":close(av,bv,1.05 if m in ("sales","waste","clearance") else .05)}
+            if metrics: pairs.append({"fileA":a.get("file"),"fileB":b.get("file"),"metrics":metrics,"matched":all(v["matched"] for v in metrics.values())})
+    return {"ok":True,"version":APP_VERSION,"results":results,"crossFileValidation":{"pairs":pairs,"status":"passed" if pairs and all(p["matched"] for p in pairs) else ("partial" if pairs else "not_applicable")}}
 
 @app.post("/parse-file")
 async def parse_file(file: UploadFile = File(...)):
