@@ -7,12 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import fitz
-import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
+try:
+    import xlrd
+except Exception:
+    xlrd = None
+from odf.opendocument import load as load_ods
+from odf.table import Table, TableRow, TableCell, CoveredTableCell
+from odf import teletype
+from odf.namespaces import TABLENS
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 MAX_BYTES = 30 * 1024 * 1024
 SUPPORTED = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "txt"]
 
@@ -86,12 +93,13 @@ def to_iso(v: Any):
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except Exception:
             pass
-    try:
-        dt = pd.to_datetime(v, errors="coerce")
-        if not pd.isna(dt):
-            return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
+    # Conservative fallback for common date-time strings. Avoid heavyweight pandas
+    # so the parser stays inside Render Free memory limits.
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
     return None
 
 
@@ -458,22 +466,108 @@ def parse_daily_sales_table(table, name, source_type, sheet=None):
     return finalize_daily_sales(detail, name, source_type, sheet, source_totals, summary_rows)
 
 
-def dataframe_to_table(df: pd.DataFrame):
-    return [[None if pd.isna(x) else x for x in row] for row in df.itertuples(index=False, name=None)]
+def _ods_cell_value(cell):
+    text = clean(teletype.extractText(cell))
+    if text:
+        return text
+    for attr in ("value", "datevalue", "timevalue", "booleanvalue"):
+        try:
+            v = cell.getAttribute(attr)
+            if v not in (None, ""):
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _ods_table_rows(table_node):
+    rows = []
+    # Cap repeated blank rows/columns defensively; malicious or highly formatted
+    # ODS files can otherwise expand to huge in-memory matrices.
+    MAX_REPEAT = 10000
+    for row_node in table_node.getElementsByType(TableRow):
+        try:
+            rrep = int(row_node.getAttribute("numberrowsrepeated") or 1)
+        except Exception:
+            rrep = 1
+        rrep = max(1, min(rrep, MAX_REPEAT))
+        row = []
+        for cell in row_node.childNodes:
+            qname = getattr(cell, "qname", None)
+            if qname not in ((TABLENS, "table-cell"), (TABLENS, "covered-table-cell")):
+                continue
+            try:
+                crep = int(cell.getAttribute("numbercolumnsrepeated") or 1)
+            except Exception:
+                crep = 1
+            crep = max(1, min(crep, 512))
+            value = _ods_cell_value(cell) if qname == (TABLENS, "table-cell") else None
+            row.extend([value] * crep)
+        # Trim trailing empty cells to keep memory bounded.
+        while row and clean(row[-1]) == "":
+            row.pop()
+        for _ in range(rrep):
+            rows.append(list(row))
+    return rows
 
 
 def load_spreadsheet_tables(data: bytes, ext: str):
     if ext in (".xlsx", ".xlsm"):
-        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=False)
-        return [(ws.title, [list(r) for r in ws.iter_rows(values_only=True)]) for ws in wb.worksheets]
+        # read_only=True is critical on small Render instances: openpyxl's normal
+        # mode materializes styles/cells and can push the process over memory.
+        wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        try:
+            out = []
+            for ws in wb.worksheets:
+                # Some ERP exports incorrectly declare A1:A1 as the worksheet
+                # dimension even though thousands of cells exist. In read-only
+                # mode that would make openpyxl return only A1, so force a
+                # dimension rescan when the declared range is suspicious.
+                if (ws.max_row or 0) <= 1 and (ws.max_column or 0) <= 1:
+                    try:
+                        ws.reset_dimensions()
+                    except Exception:
+                        pass
+                rows = [list(r) for r in ws.iter_rows(values_only=True)]
+                out.append((ws.title, rows))
+            return out
+        finally:
+            wb.close()
     if ext == ".xls":
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="xlrd")
-        return [(name, dataframe_to_table(df)) for name, df in sheets.items()]
+        if xlrd is None:
+            raise ValueError("XLS 解析套件未安裝")
+        book = xlrd.open_workbook(file_contents=data, on_demand=True)
+        out = []
+        try:
+            for sheet in book.sheets():
+                rows = []
+                for rx in range(sheet.nrows):
+                    vals = []
+                    for cx in range(sheet.ncols):
+                        cell = sheet.cell(rx, cx)
+                        v = cell.value
+                        if cell.ctype == xlrd.XL_CELL_DATE:
+                            try:
+                                v = xlrd.xldate_as_datetime(v, book.datemode)
+                            except Exception:
+                                pass
+                        vals.append(v)
+                    rows.append(vals)
+                out.append((sheet.name, rows))
+            return out
+        finally:
+            try:
+                book.release_resources()
+            except Exception:
+                pass
     if ext == ".ods":
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="odf")
-        return [(name, dataframe_to_table(df)) for name, df in sheets.items()]
+        doc = load_ods(io.BytesIO(data))
+        out = []
+        for tbl in doc.spreadsheet.getElementsByType(Table):
+            name = tbl.getAttribute("name") or "Sheet"
+            out.append((name, _ods_table_rows(tbl)))
+        return out
     raise ValueError("unsupported")
-
 
 def decode_text(data: bytes):
     for enc in ("utf-8-sig", "cp950", "big5", "utf-8", "utf-16", "latin1"):
