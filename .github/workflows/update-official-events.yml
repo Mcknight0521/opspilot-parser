@@ -1,0 +1,40 @@
+name: Update official events
+
+on:
+  schedule:
+    - cron: '17 16 * * *' # 00:17 Taiwan time
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/update_official_events.py'
+      - '.github/workflows/update-official-events.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opspilot-official-events
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Refresh DGPA and CWA event data
+        run: python scripts/update_official_events.py
+      - name: Commit only when data changed
+        run: |
+          if git diff --quiet -- data/official_events.json; then
+            echo "No event changes"
+            exit 0
+          fi
+          git config user.name "opspilot-event-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/official_events.json
+          git commit -m "chore: update official event data"
+          git push
