@@ -5,6 +5,9 @@ import re
 import urllib.request
 import urllib.parse
 import html as html_lib
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,7 +25,7 @@ from odf.table import Table, TableRow, TableCell, CoveredTableCell
 from odf import teletype
 from odf.namespaces import TABLENS
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.2.0"
 MAX_BYTES = 30 * 1024 * 1024
 SUPPORTED = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "txt"]
 
@@ -832,134 +835,79 @@ COUNTY_NAMES = [
     "雲林縣","嘉義市","嘉義縣","臺南市","高雄市","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"
 ]
 
-def _http_text(url: str, timeout: int = 20) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 OpsPilot/3.2"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-        enc = r.headers.get_content_charset() or "utf-8"
+# v4.2 Event Store
+# ----------------
+# User-facing requests never crawl DGPA/CWA. GitHub Actions refreshes this small
+# JSON file automatically; the API only reads and filters it, so /history-events
+# remains fast and predictable even when an official website is slow.
+EVENT_STORE_PATH = Path(__file__).resolve().parent / "data" / "official_events.json"
+EVENT_STORE_MAX_RANGE_DAYS = 3660
+_event_store_cache = {"mtime": None, "payload": None}
+_event_store_lock = threading.Lock()
+
+def _load_event_store() -> dict:
+    try:
+        stat = EVENT_STORE_PATH.stat()
+        mtime = stat.st_mtime_ns
+    except FileNotFoundError:
+        return {"schemaVersion": 1, "updatedAt": None, "coverage": {}, "events": []}
+    with _event_store_lock:
+        if _event_store_cache.get("mtime") == mtime and isinstance(_event_store_cache.get("payload"), dict):
+            return _event_store_cache["payload"]
         try:
-            return raw.decode(enc, errors="replace")
+            with EVENT_STORE_PATH.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
         except Exception:
-            return raw.decode("utf-8", errors="replace")
-
-def _strip_html(v: str) -> str:
-    v = re.sub(r"<script[\s\S]*?</script>", " ", v or "", flags=re.I)
-    v = re.sub(r"<style[\s\S]*?</style>", " ", v, flags=re.I)
-    v = re.sub(r"<[^>]+>", " ", v)
-    return re.sub(r"\s+", " ", html_lib.unescape(v)).strip()
-
-def _roc_to_iso(y: str, m: str, d: str) -> str:
-    return f"{int(y)+1911:04d}-{int(m):02d}-{int(d):02d}"
-
-def _extract_history_links(page_html: str, base: str) -> list[dict]:
-    out, seen = [], set()
-    for m in re.finditer(r'<a[^>]+href=["\']([^"\']*information\?[^"\']*pid=\d+[^"\']*)["\'][^>]*>([\s\S]*?)</a>', page_html or '', re.I):
-        href, label = m.group(1), _strip_html(m.group(2))
-        around = _strip_html((page_html or '')[max(0,m.start()-260):m.end()+260])
-        dm = re.search(r'(\d{2,3})年\s*(\d{1,2})月\s*(\d{1,2})日', label + ' ' + around)
-        if not dm:
-            continue
-        url = urllib.parse.urljoin(base, html_lib.unescape(href))
-        key = (url, dm.group(0))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"date": _roc_to_iso(*dm.groups()), "url": url, "title": label or around[:120]})
-    return out
-
-def _extract_nds_links(detail_html: str, base: str) -> list[str]:
-    out=[]
-    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>', detail_html or '', re.I):
-        href, label = html_lib.unescape(m.group(1)), _strip_html(m.group(2))
-        if re.search(r'nds(?:E)?\.html|停止上班|停止辦公|停止上課', href+' '+label, re.I) and not re.search(r'ndsE\.html', href, re.I):
-            u=urllib.parse.urljoin(base, href)
-            if u not in out: out.append(u)
-    return out
-
-def _parse_region_closure(nds_html: str, region: str) -> dict:
-    plain = _strip_html(nds_html)
-    idx = plain.find(region)
-    if idx < 0:
-        return {"found": False, "closure": False, "detail": ""}
-    tail = plain[idx+len(region):]
-    stops=[]
-    for county in COUNTY_NAMES:
-        j=tail.find(county)
-        if j>=0: stops.append(j)
-    chunk = tail[:min(stops) if stops else 700].strip()
-    closure = bool(re.search(r'停止上班|停止上課|停止辦公|停班|停課', chunk)) and not bool(re.search(r'照常上班.{0,40}照常上課|正常上班.{0,40}正常上課', chunk))
-    scope = "partial"
-    if closure and re.match(r'^[：: ]*(?:今天|明天)?停止上班[、,， ]*(?:今天|明天)?停止上課', chunk):
-        scope = "countywide"
-    return {"found": True, "closure": closure, "detail": chunk[:500], "scope": scope}
-
-def _dgpa_closures(start: str, end: str, region: str) -> list[dict]:
-    base='https://www.dgpa.gov.tw'
-    targets=[]
-    start_dt=datetime.strptime(start,'%Y-%m-%d').date()
-    end_dt=datetime.strptime(end,'%Y-%m-%d').date()
-    for page in range(1,51):
-        url=f'{base}/informationlist?page={page}&uid=374'
-        try:
-            text=_http_text(url)
-        except Exception:
-            if page>3: break
-            continue
-        items=_extract_history_links(text,url)
-        if not items:
-            if page>3: break
-            continue
-        page_dates=[]
-        for it in items:
-            try: d=datetime.strptime(it['date'],'%Y-%m-%d').date()
-            except Exception: continue
-            page_dates.append(d)
-            if start_dt <= d <= end_dt:
-                targets.append(it)
-        if page_dates and min(page_dates) < start_dt:
-            break
-    uniq={x['url']:x for x in targets}.values()
-    out=[]
-    for it in uniq:
-        try:
-            detail=_http_text(it['url'])
-        except Exception:
-            continue
-        nds_links=_extract_nds_links(detail,it['url'])
-        parsed=None
-        for u in nds_links:
-            try:
-                parsed=_parse_region_closure(_http_text(u),region)
-            except Exception:
-                continue
-            if parsed.get('found'): break
-        if parsed and parsed.get('closure'):
-            out.append({
-                "type":"closure", "date":it['date'],
-                "name":"全縣停班停課" if parsed.get('scope')=='countywide' else "部分地區停班停課",
-                "detail":parsed.get('detail',''), "scope":parsed.get('scope','partial'),
-                "source":"行政院人事行政總處"
-            })
-    return sorted(out,key=lambda x:x['date'])
+            payload = {"schemaVersion": 1, "updatedAt": None, "coverage": {}, "events": []}
+        if not isinstance(payload.get("events"), list):
+            payload["events"] = []
+        _event_store_cache.update({"mtime": mtime, "payload": payload})
+        return payload
 
 @app.get("/history-events")
 def history_events(start: str, end: str, region: str = "屏東縣"):
     try:
-        datetime.strptime(start, "%Y-%m-%d")
-        datetime.strptime(end, "%Y-%m-%d")
+        start_dt=datetime.strptime(start, "%Y-%m-%d").date()
+        end_dt=datetime.strptime(end, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=422, detail="start/end must be YYYY-MM-DD")
+    if end_dt < start_dt:
+        raise HTTPException(status_code=422, detail="end must not be earlier than start")
+    if (end_dt-start_dt).days > EVENT_STORE_MAX_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"單次歷史事件查詢最多 {EVENT_STORE_MAX_RANGE_DAYS} 天")
     if region not in COUNTY_NAMES:
         raise HTTPException(status_code=422, detail="unsupported region")
-    try:
-        closures=_dgpa_closures(start,end,region)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"DGPA history lookup failed: {e}")
-    return {"ok":True,"region":region,"start":start,"end":end,"events":closures,"sources":["行政院人事行政總處"]}
+
+    t0=time.perf_counter()
+    store=_load_event_store()
+    out=[]
+    for e in store.get("events", []):
+        d=str(e.get("date") or "")
+        if not (start <= d <= end):
+            continue
+        typ=e.get("type")
+        if typ == "closure" and e.get("region") != region:
+            continue
+        if typ not in {"closure", "typhoon"}:
+            continue
+        out.append(e)
+    out.sort(key=lambda x:(x.get("date", ""), 0 if x.get("type")=="closure" else 1, x.get("name", "")))
+    coverage=store.get("coverage") or {}
+    return {
+        "ok":True,"region":region,"start":start,"end":end,"events":out,
+        "sources":["行政院人事行政總處","中央氣象署"],
+        "meta":{
+            "mode":"pre_synced_official_event_store",
+            "updatedAt":store.get("updatedAt"),
+            "coverage":coverage,
+            "eventCount":len(out),
+            "elapsedMs":round((time.perf_counter()-t0)*1000,2)
+        }
+    }
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "opspilot-parser", "version": APP_VERSION, "engine": "Trust Engine v4", "formats": SUPPORTED, "endpoint": "/parse-file", "multiFileEndpoint": "/verify-files", "historyEndpoint": "/history-events"}
+    return {"ok": True, "service": "opspilot-parser", "version": APP_VERSION, "engine": "Trust Engine v4.2", "formats": SUPPORTED, "endpoint": "/parse-file", "multiFileEndpoint": "/verify-files", "historyEndpoint": "/history-events"}
 
 
 @app.post("/verify-files")
