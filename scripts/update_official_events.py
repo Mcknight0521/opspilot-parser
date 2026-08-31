@@ -13,13 +13,46 @@ OUT=ROOT/'data'/'official_events.json'
 DGPA='https://www.dgpa.gov.tw'
 CWA='https://rdc28.cwa.gov.tw'
 COUNTIES=["基隆市","臺北市","新北市","桃園市","新竹市","新竹縣","苗栗縣","臺中市","彰化縣","南投縣","雲林縣","嘉義市","嘉義縣","臺南市","高雄市","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"]
-UA='Mozilla/5.0 OpsPilot-EventSync/4.2'
+UA='Mozilla/5.0 OpsPilot-EventSync/4.4'
+
+def _decode_quality(text):
+    # Higher is better. Replacement characters are a strong sign of a bad decode.
+    cjk=sum(1 for ch in text if '\u3400' <= ch <= '\u9fff')
+    replacement=text.count('\ufffd')
+    controls=sum(1 for ch in text if ord(ch)<32 and ch not in '\n\r\t')
+    return cjk*4 - replacement*200 - controls*20
+
+def decode_web_bytes(raw, declared=None):
+    """Decode Taiwanese government pages defensively.
+
+    Some legacy pages/attachments advertise an incorrect or incomplete charset.
+    Prefer a strict UTF-8 decode when possible, then honor meta/header hints, then
+    try Big5/CP950.  Pick the candidate that yields real CJK text without U+FFFD.
+    """
+    head=raw[:8192].decode('ascii',errors='ignore')
+    meta=[]
+    for pat in (r'charset\s*=\s*["\']?([A-Za-z0-9._-]+)', r'encoding\s*=\s*["\']([^"\']+)'):
+        m=re.search(pat,head,re.I)
+        if m: meta.append(m.group(1))
+    candidates=[]
+    for enc in ['utf-8-sig','utf-8',*(meta or []),declared,'cp950','big5']:
+        if not enc or enc.lower() in {x.lower() for x,_ in candidates}:
+            continue
+        try:
+            text=raw.decode(enc,errors='strict')
+            candidates.append((enc,text))
+        except (UnicodeDecodeError,LookupError):
+            pass
+    if not candidates:
+        return raw.decode('utf-8',errors='replace')
+    candidates.sort(key=lambda x:_decode_quality(x[1]),reverse=True)
+    return candidates[0][1]
 
 def get(url, timeout=12):
     req=Request(url,headers={'User-Agent':UA,'Accept-Language':'zh-TW,zh;q=0.9','Connection':'close'})
     with urlopen(req,timeout=timeout) as r:
-        raw=r.read(2*1024*1024); enc=r.headers.get_content_charset() or 'utf-8'
-    return raw.decode(enc,errors='replace')
+        raw=r.read(2*1024*1024); declared=r.headers.get_content_charset()
+    return decode_web_bytes(raw,declared)
 
 def strip(s):
     s=re.sub(r'<script[\s\S]*?</script>|<style[\s\S]*?</style>',' ',s or '',flags=re.I)
@@ -127,8 +160,15 @@ def main():
     try: payload=json.loads(OUT.read_text(encoding='utf-8'))
     except: payload={'events':[]}
     events=payload.get('events') or []
+    # v4.4 self-heals stores produced by an earlier bad charset decode. If any
+    # replacement/mojibake marker is present, rebuild the requested history once.
+    sample=' '.join(str(e.get(k,'')) for e in events for k in ('region','name','detail','source'))
+    polluted=('\ufffd' in sample)
     bootstrap=not events or (payload.get('coverage') or {}).get('status')=='bootstrap_pending'
-    full=args.full or bootstrap
+    full=args.full or bootstrap or polluted
+    if polluted:
+        print('Detected mojibake in existing event store; forcing clean full rebuild')
+        events=[]
     events,dgpa_floor=sync_dgpa(events,full,args.years_back)
     events,cwa_floor=sync_cwa(events,full,args.years_back)
     dedup={}
