@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import re
 import urllib.request
@@ -25,7 +26,7 @@ from odf.table import Table, TableRow, TableCell, CoveredTableCell
 from odf import teletype
 from odf.namespaces import TABLENS
 
-APP_VERSION = "4.2.0"
+APP_VERSION = "4.3.0"
 MAX_BYTES = 30 * 1024 * 1024
 SUPPORTED = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "txt"]
 
@@ -907,7 +908,22 @@ def history_events(start: str, end: str, region: str = "屏東縣"):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "opspilot-parser", "version": APP_VERSION, "engine": "Trust Engine v4.2", "formats": SUPPORTED, "endpoint": "/parse-file", "multiFileEndpoint": "/verify-files", "historyEndpoint": "/history-events"}
+    store = _load_event_store()
+    return {
+        "ok": True,
+        "service": "opspilot-parser",
+        "version": APP_VERSION,
+        "engine": "Trust Engine v4.3",
+        "formats": SUPPORTED,
+        "endpoint": "/parse-file",
+        "multiFileEndpoint": "/verify-files",
+        "historyEndpoint": "/history-events",
+        "eventStore": {
+            "updatedAt": store.get("updatedAt"),
+            "status": (store.get("coverage") or {}).get("status"),
+            "eventCount": len(store.get("events") or []),
+        },
+    }
 
 
 @app.post("/verify-files")
