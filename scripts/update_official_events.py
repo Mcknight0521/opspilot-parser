@@ -15,6 +15,14 @@ CWA='https://rdc28.cwa.gov.tw'
 COUNTIES=["基隆市","臺北市","新北市","桃園市","新竹市","新竹縣","苗栗縣","臺中市","彰化縣","南投縣","雲林縣","嘉義市","嘉義縣","臺南市","高雄市","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"]
 UA='Mozilla/5.0 OpsPilot-EventSync/4.4'
 
+# Terms that can appear near a generic「名稱」label on CWA pages but are not
+# typhoon names.  In particular, this prevents wildlife/news labels such as
+#「白海豚」from ever being promoted to a typhoon event.
+INVALID_TYPHOON_NAMES={
+    '白海豚','豪雨','大豪雨','強風','天氣','警報','颱風警報','海上','陸上',
+    '發布','解除','臺灣','台灣','中央氣象署','氣象署','名稱','概況'
+}
+
 def _decode_quality(text):
     # Higher is better. Replacement characters are a strong sign of a bad decode.
     cjk=sum(1 for ch in text if '\u3400' <= ch <= '\u9fff')
@@ -126,10 +134,38 @@ def sync_dgpa(existing, full, years_back):
     keep=[e for e in existing if e.get('type')!='closure' or e.get('date','')<floor.isoformat()]
     return keep+fresh, floor.isoformat()
 
+def _clean_typhoon_name(raw):
+    name=strip(raw or '')
+    name=re.sub(r'^[：:|｜\s]+|[：:|｜\s]+$','',name)
+    name=re.sub(r'(?:颱風|台風)$','',name).strip()
+    if not name or name in INVALID_TYPHOON_NAMES:
+        return None
+    if len(name)>12 or re.search(r'\d|20\d{2}|發布|解除|警報|豪雨|強風|海上|陸上|氣象|白海豚',name):
+        return None
+    if not any('\u3400' <= ch <= '\u9fff' for ch in name):
+        return None
+    return name
+
 def parse_typhoon(text,tyid):
     p=strip(text)
     if not re.search(r'颱風概況表|發布時間',p): return None
-    name=(re.search(r'名稱\s*[:|]?\s*([^\s(（|]{1,12})',p) or [None,None])[1]
+
+    # Do not use a free-floating「名稱」match: CWA pages contain other named
+    # entities, which previously allowed unrelated labels (e.g. 白海豚) through.
+    # Prefer labels that explicitly identify the typhoon name and only fall back
+    # to a tightly bounded「名稱」occurring next to「颱風」.
+    name=None
+    name_patterns=(
+        r'(?:颱風名稱|中文名稱)\s*[:|｜]?\s*([^\s(（|｜:：]{1,12})',
+        r'颱風.{0,18}?名稱\s*[:|｜]?\s*([^\s(（|｜:：]{1,12})',
+        r'名稱\s*[:|｜]?\s*([^\s(（|｜:：]{1,12})\s*(?:颱風|台風)'
+    )
+    for pat in name_patterns:
+        m=re.search(pat,p,re.I)
+        if m:
+            name=_clean_typhoon_name(m.group(1))
+            if name: break
+
     sea=(re.search(r'海上\s*(20\d{2}-\d{2}-\d{2})\s*\d{2}:\d{2}',p) or [None,None])[1]
     land=(re.search(r'陸上\s*(20\d{2}-\d{2}-\d{2})\s*\d{2}:\d{2}',p) or [None,None])[1]
     releases=[m.group(1) or m.group(2) for m in re.finditer(r'解除時間[^2]*(?:陸上\s*)?(20\d{2}-\d{2}-\d{2})\s*\d{2}:\d{2}|海上\s*(20\d{2}-\d{2}-\d{2})\s*\d{2}:\d{2}',p)]
@@ -171,6 +207,19 @@ def main():
         events=[]
     events,dgpa_floor=sync_dgpa(events,full,args.years_back)
     events,cwa_floor=sync_cwa(events,full,args.years_back)
+
+    # Remove any bad historical typhoon labels already present in the store so
+    # incremental runs self-heal instead of retaining an old false positive.
+    clean_events=[]
+    for e in events:
+        if e.get('type')=='typhoon':
+            raw_name=str(e.get('name') or '')
+            base=re.sub(r'(?:颱風|台風)$','',raw_name).strip()
+            if not _clean_typhoon_name(base):
+                continue
+        clean_events.append(e)
+    events=clean_events
+
     dedup={}
     for e in events:
         key=(e.get('type'),e.get('date'),e.get('region',''),e.get('name',''))
