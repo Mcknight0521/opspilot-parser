@@ -15,6 +15,7 @@ from typing import Any
 
 import fitz
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 try:
@@ -26,7 +27,7 @@ from odf.table import Table, TableRow, TableCell, CoveredTableCell
 from odf import teletype
 from odf.namespaces import TABLENS
 
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.4.0"
 MAX_BYTES = 30 * 1024 * 1024
 SUPPORTED = ["pdf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "txt"]
 
@@ -836,7 +837,7 @@ COUNTY_NAMES = [
     "雲林縣","嘉義市","嘉義縣","臺南市","高雄市","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"
 ]
 
-# v4.2 Event Store
+# v4.4 Event Store
 # ----------------
 # User-facing requests never crawl DGPA/CWA. GitHub Actions refreshes this small
 # JSON file automatically; the API only reads and filters it, so /history-events
@@ -894,7 +895,7 @@ def history_events(start: str, end: str, region: str = "屏東縣"):
         out.append(e)
     out.sort(key=lambda x:(x.get("date", ""), 0 if x.get("type")=="closure" else 1, x.get("name", "")))
     coverage=store.get("coverage") or {}
-    return {
+    payload={
         "ok":True,"region":region,"start":start,"end":end,"events":out,
         "sources":["行政院人事行政總處","中央氣象署"],
         "meta":{
@@ -905,6 +906,9 @@ def history_events(start: str, end: str, region: str = "屏東縣"):
             "elapsedMs":round((time.perf_counter()-t0)*1000,2)
         }
     }
+    # Explicit charset avoids raw/mobile viewers guessing a legacy encoding.
+    body=json.dumps(payload,ensure_ascii=False,separators=(",", ":")).encode("utf-8")
+    return Response(content=body,media_type="application/json; charset=utf-8")
 
 @app.get("/health")
 def health():
@@ -913,7 +917,7 @@ def health():
         "ok": True,
         "service": "opspilot-parser",
         "version": APP_VERSION,
-        "engine": "Trust Engine v4.3",
+        "engine": "Trust Engine v4.4",
         "formats": SUPPORTED,
         "endpoint": "/parse-file",
         "multiFileEndpoint": "/verify-files",
